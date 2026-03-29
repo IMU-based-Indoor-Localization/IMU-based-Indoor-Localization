@@ -12,7 +12,7 @@ from model import IMU_ResNet_MTL
 from loss import MTL_CustomLoss
 
 def train_model():
-    data_dir = r"C:\Users\zihyun2777\Documents\학교\project\spice-ai-copilot\dataset"
+    data_dir = r"c:\Users\hs091\Desktop\train2\dataset"
     
     dataset = IMUDataset(data_dir, window_size=100, step_size=50)
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True, drop_last=True)
@@ -20,7 +20,7 @@ def train_model():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"💻 사용하는 디바이스: {device}")
     
-    model = IMU_ResNet_MTL(in_channels=12, num_classes=6).to(device)
+    model = IMU_ResNet_MTL(in_channels=12, num_classes=7).to(device)
     criterion = MTL_CustomLoss(lambda_pos=10.0, lambda_unc=1.0, lambda_cls=1.0).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     
