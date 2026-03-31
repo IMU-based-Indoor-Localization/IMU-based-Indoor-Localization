@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+import os
 
 # 업로드된 모듈 임포트
 from model import IMU_ResNet_MTL
@@ -17,106 +18,114 @@ def run_visualizer(csv_path, model_path):
     step_size = 10  # 시각화 속도를 위해 10개 샘플마다 추론
     
     # 1. 모델 및 클래스 초기화
+    # 모델 정의: num_classes는 학습 시 설정에 따라 6 또는 7일 수 있음
     model = IMU_ResNet_MTL(in_channels=12, num_classes=7).to(device)
     try:
-        if torch.cuda.is_available():
-            model.load_state_dict(torch.load(model_path))
+        if os.path.exists(model_path):
+            state_dict = torch.load(model_path, map_location=device)
+            model.load_state_dict(state_dict)
+            print(f"✅ 모델 로드 성공: {model_path}")
         else:
-            model.load_state_dict(torch.load(model_path, map_location='cpu'))
-        print(f"✅ 모델 로드 성공: {model_path}")
+            print(f"⚠️ 모델 파일을 찾을 수 없습니다: {model_path}. 무작위 가중치로 진행합니다.")
     except Exception as e:
-        print(f"⚠️ 모델 로드 실패: {e}. 무작위 가중치로 진행합니다.")
+        print(f"⚠️ 모델 로드 중 오류 발생: {e}. 무작위 가중치로 진행합니다.")
     
     manager = TLIO_EKF_Manager(model, device=device)
-    ekf = TLIO_EKF() # EKF 본체 (pos, vel 초기화됨)
+    ekf = TLIO_EKF() # EKF 본체 (AI-EKF 융합용)
     
     # 2. 데이터 로드
     try:
         df = pd.read_csv(csv_path)
+        print(f"✅ 데이터 로드 성공: {csv_path} (총 {len(df)} 행)")
     except Exception as e:
         print(f"❌ CSV 로드 실패: {e}")
         return
 
-    # feature_cols 정의
+    # 입력 데이터로 사용할 컬럼 정의
     feature_cols = [
         'user_acc_x(m/s^2)', 'user_acc_y(m/s^2)', 'user_acc_z(m/s^2)',
         'rotation_rate_x(rad/s)', 'rotation_rate_y(rad/s)', 'rotation_rate_z(rad/s)',
         'gravity_x(m/s^2)', 'gravity_y(m/s^2)', 'gravity_z(m/s^2)',
         'attitude_roll(rad)', 'attitude_pitch(rad)', 'attitude_yaw(rad)'
     ]
-    
-    traj_ref = []  # 정답 경로 (Ground Truth)
-    traj_imu = []  # IMU 전용 경로 (Pure Double Integration)
-    traj_ekf = []  # AI-EKF 융합 경로
-    
-    # IMU Only 변수 초기화
-    pos_imu = np.zeros(3)
-    vel_imu = np.zeros(3)
-    
-    print("🔄 궤적 계산 및 필터링 시작...")
-    
-    # 3. 메인 루프 (Sliding Window 방식)
-    for i in range(0, len(df) - window_size, step_size):
-        # 현재 윈도우 데이터 추출
-        window_df = df.iloc[i : i + window_size]
-        window_data = window_df[feature_cols].values
-        
-        # --- A. 정답 데이터 (Vicon Delta 누적) ---
-        # 0번부터 현재 i까지의 누적 변위를 계산하여 위치 복원
-        ref_x = df['target_delta_x'].iloc[:i+window_size].sum()
-        ref_y = df['target_delta_y'].iloc[:i+window_size].sum()
-        ref_z = df['target_delta_z'].iloc[:i+window_size].sum()
-        traj_ref.append([ref_x, ref_y, ref_z])
-        
-        # --- B. IMU Only (가속도 이중 적분) ---
-        # 윈도우의 마지막 가속도 값을 사용하여 dt*step_size만큼 적분
-        acc_raw = window_data[-1, 0:3]
-        total_dt = dt * step_size
-        vel_imu += acc_raw * total_dt
-        pos_imu += vel_imu * total_dt
-        traj_imu.append(pos_imu.copy())
-        
-        # --- C. AI-EKF 융합 ---
-        # 1. AI 관측치 획득 (z: 델타 변위/회전, R: 조정된 공분산)
-        obs = manager.get_observation(window_data)
-        
-        # 2. EKF 예측 (IMU 가속도 기반)
-        ekf.predict(total_dt, acc_raw)
-        
-        # 3. EKF 보정 (AI가 예측한 변위 6차원 중 위치 관련 3차원만 사용)
-        # obs['z'] index: 0=dx, 1=dy, 2=dz
-        z_ai = obs['z'][:3]
-        R_ai = obs['R'][:3, :3]
-        
-        updated_state, _ = ekf.update(z_ai, R_ai)
-        traj_ekf.append(updated_state[0:3].flatten())
 
-    # 4. 데이터 배열 변환
-    traj_ref = np.array(traj_ref)
-    traj_imu = np.array(traj_imu)
-    traj_ekf = np.array(traj_ekf)
+    # 가속도 데이터 추출 (IMU 적분용)
+    raw_accs = df[['user_acc_x(m/s^2)', 'user_acc_y(m/s^2)', 'user_acc_z(m/s^2)']].values
     
-    # 5. 3D 시각화
-    fig = plt.figure(figsize=(12, 9))
+    # 정답 궤적 계산 (Target Delta x, y, z만 사용)
+    target_deltas = df[['target_delta_x', 'target_delta_y', 'target_delta_z']].values
+    traj_ref = np.cumsum(target_deltas, axis=0)
+
+    # 결과 저장을 위한 리스트
+    traj_ekf = []      # AI + IMU (EKF)
+    traj_imu = []      # Pure IMU (Dead Reckoning)
+    traj_ai_only = []  # 순수 네트워크 예측값 누적
+    
+    # 초기 상태 설정
+    curr_pos_imu = np.zeros(3)
+    curr_vel_imu = np.zeros(3)
+    curr_pos_ai = np.zeros(3) # AI 전용 위치 누적기
+    
+    print("🏃 시뮬레이션 시작...")
+    
+    # 3. 루프 실행
+    for i in range(window_size, len(df), step_size):
+        # A. Pure IMU 적분 (비교용)
+        for j in range(step_size):
+            idx = i - step_size + j
+            acc = raw_accs[idx]
+            curr_vel_imu += acc * dt
+            curr_pos_imu += curr_vel_imu * dt
+        traj_imu.append(curr_pos_imu.copy())
+        
+        # B. EKF 예측 단계 (IMU 입력)
+        for j in range(step_size):
+            ekf.predict(dt, raw_accs[i - step_size + j])
+            
+        # C. EKF 보정 단계 (AI 모델 입력)
+        window_data = df.iloc[i-window_size:i][feature_cols].values
+        
+        # AI 추론
+        obs_data = manager.get_observation(window_data)
+        z_full = obs_data['z']  # 네트워크가 예측한 값 (6차원: [dx, dy, dz, dRoll, dPitch, dYaw])
+        R_full = obs_data['R']  # 불확실성 행렬 (6x6)
+        
+        # 에러 해결: EKF는 위치(3차원)만 관측하므로 앞의 3개만 추출
+        # z_full.shape가 (6, 1)이거나 (6,)인 경우를 대비해 슬라이싱 후 리셰이프
+        z_pos = z_full.flatten()[:3].reshape(3, 1)
+        R_pos = R_full[:3, :3] # 공분산 행렬도 3x3으로 슬라이싱
+        
+        # EKF Update (위치 정보만 업데이트)
+        ekf.update(z_pos, R_pos)
+        traj_ekf.append(ekf.x[0:3].flatten())
+        
+        # D. 순수 AI 출력값 누적
+        curr_pos_ai += z_pos.flatten() 
+        traj_ai_only.append(curr_pos_ai.copy())
+
+    # 리스트를 넘파이 배열로 변환
+    traj_ekf = np.array(traj_ekf)
+    traj_imu = np.array(traj_imu)
+    traj_ai_only = np.array(traj_ai_only)
+    
+    # 4. 시각화
+    fig = plt.figure(figsize=(12, 8))
     ax = fig.add_subplot(111, projection='3d')
     
-    # 정답 궤적 (초록 실선)
-    ax.plot(traj_ref[:,0], traj_ref[:,1], traj_ref[:,2], 'g-', label='Reference (Ground Truth)', lw=2)
-    
-    # AI-EKF 융합 궤적 (파란 실선)
+    ax.scatter(0, 0, 0, color='black', s=100, label='Start', marker='x', zorder=10)
+    ax.plot(traj_ref[:,0], traj_ref[:,1], traj_ref[:,2], 'g-', label='Reference (GT)', lw=2)
     ax.plot(traj_ekf[:,0], traj_ekf[:,1], traj_ekf[:,2], 'b-', label='AI-EKF Fusion', lw=1.5)
+    ax.plot(traj_ai_only[:,0], traj_ai_only[:,1], traj_ai_only[:,2], color='orange', label='AI-Only (Network Output)', lw=1.2)
+    ax.plot(traj_imu[:,0], traj_imu[:,1], traj_imu[:,2], 'r--', label='Pure IMU (Dead Reckoning)', alpha=0.4)
     
-    # 순수 IMU 적분 궤적 (빨간 점선)
-    ax.plot(traj_imu[:,0], traj_imu[:,1], traj_imu[:,2], 'r--', label='Pure IMU (Dead Reckoning)', alpha=0.5)
-    
-    ax.set_title("3D Trajectory Comparison: IMU vs AI-EKF vs Ground Truth")
+    ax.set_title("3D Trajectory: IMU vs AI vs EKF Fusion")
     ax.set_xlabel("X (m)")
     ax.set_ylabel("Y (m)")
     ax.set_zlabel("Z (m)")
     ax.legend()
     
-    # 보기 좋게 스케일 조정
-    all_points = np.vstack([traj_ref, traj_ekf])
+    # 스케일 조정
+    all_points = np.vstack([traj_ref, traj_ekf, traj_ai_only])
     max_range = np.array([all_points[:,0].max()-all_points[:,0].min(), 
                           all_points[:,1].max()-all_points[:,1].min(), 
                           all_points[:,2].max()-all_points[:,2].min()]).max() / 2.0
@@ -126,13 +135,11 @@ def run_visualizer(csv_path, model_path):
     ax.set_xlim(mid_x - max_range, mid_x + max_range)
     ax.set_ylim(mid_y - max_range, mid_y + max_range)
     ax.set_zlim(mid_z - max_range, mid_z + max_range)
-
-    print("✅ 시각화 완료. 팝업 창을 확인하세요.")
+    
     plt.show()
 
 if __name__ == "__main__":
-    # 데이터셋 경로와 가중치 파일명을 확인하세요.
-    CSV_PATH = r'c:\Users\hs091\Desktop\대학\2026 1학기\전자공학종합설계\전처리 데이터 셋\handbag_11.csv'
+    CSV_PATH = '/Users/parkhaneul/Documents/IMU-based-Indoor-Localization/Dataset/large_scale_floor4_3.csv'
     MODEL_PATH = 'imu_resnet_mtl_best.pth'
     
     run_visualizer(CSV_PATH, MODEL_PATH)
