@@ -1,64 +1,163 @@
 import numpy as np
 
+def hat(v):
+    """Skew-symmetric matrix from a 3D vector."""
+    v = v.flatten()
+    return np.array([[0, -v[2], v[1]], 
+                     [v[2], 0, -v[0]], 
+                     [-v[1], v[0], 0]])
+
+def mat_exp(omega):
+    """Exponential map for SO(3)."""
+    omega = omega.flatten()
+    angle = np.linalg.norm(omega)
+    if angle < 1e-10:
+        return np.eye(3) + hat(omega)
+    axis = omega / angle
+    s = np.sin(angle)
+    c = np.cos(angle)
+    return c * np.eye(3) + (1 - c) * np.outer(axis, axis) + s * hat(axis)
+
 class TLIO_EKF:
     """
-    상태 변수 x: [pos_x, pos_y, pos_z, vel_x, vel_y, vel_z] (6차원)
-    IMU 데이터를 통해 예측(Dead Reckoning)하고, 네트워크(AI) 출력값으로 보정합니다.
-    
-    참고: 시각화 시 EKF를 거치지 않고 네트워크 출력값(z)만 누적하면 
-    'AI-Only' 궤적을 그릴 수 있습니다.
+    15-state Error-State EKF (ESEKF) mirror of TLIO architecture.
+    States: Position (3), Velocity (3), Rotation (3x3), Gyro Bias (3), Accel Bias (3).
+    Error States (dX): d_theta (3), d_v (3), d_p (3), d_bg (3), d_ba (3).
     """
-    def __init__(self, state_dim=6, obs_dim=3):
-        # 초기 상태 (위치 0, 속도 0)
-        self.x = np.zeros((state_dim, 1))
+    def __init__(self, g_norm=9.81, sigma_na=0.1, sigma_ng=0.01, ita_ba=1e-4, ita_bg=1e-6):
+        # Nominal state
+        self.p = np.zeros((3, 1))
+        self.v = np.zeros((3, 1))
+        self.R = np.eye(3)
+        self.bg = np.zeros((3, 1))
+        self.ba = np.zeros((3, 1))
         
-        # 오차 공분산 행렬 P (초기 불확실성)
-        self.P = np.eye(state_dim) * 0.1
+        # Error-state covariance (15x15)
+        self.P = np.eye(15) * 0.1
         
-        # 관측 행렬 H: AI 모델이 '변위(속도 성분)'를 예측한다고 가정 (3x6)
-        # 상태 변수의 [3, 4, 5]번째 인덱스인 속도 항을 관측함
-        self.H = np.zeros((obs_dim, state_dim))
-        self.H[:, 3:6] = np.eye(obs_dim)
+        # Constants
+        self.g = np.array([[0], [0], [-g_norm]])
+        
+        # Noise parameters
+        self.sigma_na = sigma_na  # accel noise (standard deviation)
+        self.sigma_ng = sigma_ng  # gyro noise (standard deviation)
+        self.ita_ba = ita_ba      # accel bias random walk
+        self.ita_bg = ita_bg      # gyro bias random walk
 
-    def predict(self, dt, raw_acc):
+    def initialize_orientation(self, acc_init):
         """
-        IMU 가속도 데이터를 이용한 예측 단계 (Dead Reckoning)
+        Initialize the rotation matrix R based on the initial gravity vector.
+        Aligns the World Z-axis with the measured gravity direction.
         """
-        # 1. 상태 전이 행렬 F 정의 (단순 등가속도/등속 모델)
-        F = np.eye(6)
-        F[0:3, 3:6] = np.eye(3) * dt
+        acc_init = np.array(acc_init).flatten()
+        # gravity in sensor frame: g_s = -R.T @ World_G
+        # Here we do a simple alignment:
+        # z_axis (body) = acc_init / norm(acc_init)
+        z_b = acc_init / np.linalg.norm(acc_init)
         
-        # 2. 제어 입력 모델 B (가속도를 입력으로 사용)
-        B = np.zeros((6, 3))
-        B[0:3, :] = 0.5 * (dt**2) * np.eye(3)
-        B[3:6, :] = dt * np.eye(3)
+        # Pick an arbitrary x_b that is not parallel to z_b
+        if abs(z_b[0]) < 0.9:
+            x_b = np.array([1, 0, 0])
+        else:
+            x_b = np.array([0, 1, 0])
+            
+        y_b = np.cross(z_b, x_b)
+        y_b /= np.linalg.norm(y_b)
+        x_b = np.cross(y_b, z_b)
+        x_b /= np.linalg.norm(x_b)
         
-        # 3. 상태 예측: x = Fx + Bu
-        u = raw_acc.reshape(3, 1)
-        self.x = F @ self.x + B @ u
+        # R maps Body to World. 
+        # Since acc_init is pointing 'up' in sensory space (assuming gravity subtraction hasn't happened yet),
+        # we align it with positive World Z? 
+        # Wait, if phone is on table, acc = [0, 0, 9.8], which is +Z in body.
+        # We want this to be +Z in World too.
+        self.R = np.column_stack([x_b, y_b, z_b])
+        print("EKF Orientation initialized from gravity.")
+
+    def predict(self, dt, gyr, acc):
+        """
+        IMU Propagation step.
+        gyr: list or array [gx, gy, gz]
+        acc: list or array [ax, ay, az]
+        """
+        gyr = np.array(gyr).reshape(3, 1)
+        acc = np.array(acc).reshape(3, 1)
         
-        # 4. 공분산 예측: P = FPF' + Q (Q는 시스템 노이즈)
-        Q = np.eye(6) * 0.001
+        # 1. Nominal state propagation
+        unbiased_gyr = gyr - self.bg
+        unbiased_acc = acc - self.ba
+        
+        dR = mat_exp(unbiased_gyr * dt)
+        
+        # Save old values for covariance propagation
+        R_old = self.R.copy()
+        v_old = self.v.copy()
+        
+        # Propagate nominal state
+        self.R = self.R @ dR
+        acc_w = R_old @ unbiased_acc + self.g
+        self.v = self.v + acc_w * dt
+        self.p = self.p + v_old * dt + 0.5 * acc_w * (dt**2)
+        
+        # 2. Covariance propagation (Error-state transition matrix F)
+        # Error state order: d_theta (0:3), d_v (3:6), d_p (6:9), d_bg (9:12), d_ba (12:15)
+        F = np.eye(15)
+        F[3:6, 0:3] = -R_old @ hat(unbiased_acc) * dt
+        F[6:9, 0:3] = -0.5 * R_old @ hat(unbiased_acc) * (dt**2)
+        F[6:9, 3:6] = np.eye(3) * dt
+        # F[0:3, 9:12] = -self.R * dt # Jacobian w.r.t bg
+        F[0:3, 9:12] = -R_old * dt # Simpler Jacobian
+        F[3:6, 12:15] = -R_old * dt
+        F[6:9, 12:15] = -0.5 * R_old * (dt**2)
+        
+        # System noise Q
+        Q = np.zeros((15, 15))
+        var_g = (self.sigma_ng**2) * dt
+        var_a = (self.sigma_na**2) * dt
+        var_bg = (self.ita_bg**2) * dt
+        var_ba = (self.ita_ba**2) * dt
+        
+        Q[0:3, 0:3] = np.eye(3) * var_g
+        Q[3:6, 3:6] = np.eye(3) * var_a
+        Q[9:12, 9:12] = np.eye(3) * var_bg
+        Q[12:15, 12:15] = np.eye(3) * var_ba
+        
         self.P = F @ self.P @ F.T + Q
 
-    def update(self, z, R):
+    def update(self, z, R_meas):
         """
-        네트워크(AI) 관측치를 이용한 보정 단계
-        z: 네트워크가 예측한 변위(또는 속도 성분)
-        R: 네트워크가 예측한 분산(Manager에서 상태별로 조정됨)
+        Measurement update using AI predicted displacement.
+        In this project, 'z' is often the accumulated displacement from AI.
         """
         z = z.reshape(3, 1)
         
-        # 1. 칼만 이득(Kalman Gain) 계산: K = PH'(HPH' + R)^-1
-        S = self.H @ self.P @ self.H.T + R
-        K = self.P @ self.H.T @ np.linalg.inv(S)
+        # Measurement matrix H for position (observed by AI)
+        H = np.zeros((3, 15))
+        H[:, 6:9] = np.eye(3) # Position error state
         
-        # 2. 상태 보정: x = x + K(z - Hx)
-        innovation = z - (self.H @ self.x)
-        self.x = self.x + K @ innovation
+        S = H @ self.P @ H.T + R_meas
+        K = self.P @ H.T @ np.linalg.inv(S)
         
-        # 3. 공분산 보정: P = (I - KH)P
-        I = np.eye(self.x.shape[0])
-        self.P = (I - K @ self.H) @ self.P
+        # Innovation
+        innovation = z - self.p
+        dX = K @ innovation
         
-        return self.x, K
+        # Apply correction to nominal state
+        self.p = self.p + dX[6:9]
+        self.v = self.v + dX[3:6]
+        self.R = mat_exp(dX[0:3]) @ self.R
+        self.bg = self.bg + dX[9:12]
+        self.ba = self.ba + dX[12:15]
+        
+        # Update covariance
+        I = np.eye(15)
+        self.P = (I - K @ H) @ self.P
+        
+        return self.get_state(), K
+
+    def get_state(self):
+        """Returns the 6D state for visualizer compatibility (Pos, Vel)"""
+        state = np.zeros((6, 1))
+        state[0:3] = self.p
+        state[3:6] = self.v
+        return state

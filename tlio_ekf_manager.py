@@ -7,13 +7,14 @@ class TLIO_EKF_Manager:
     학습된 IMU_ResNet_MTL 모델의 출력값을 받아 
     Extended Kalman Filter(EKF)의 관측치와 노이즈 행렬을 생성하는 클래스입니다.
     """
-    def __init__(self, model, device='cpu'):
+    def __init__(self, model, device='cpu', ekf=None):
         self.model = model.to(device)
         self.model.eval()
         self.device = device
+        self.ekf = ekf # TLIO_EKF instance
         
         # dataset.py / test.py 기준 레이블 이름
-        self.label_names = ['Trolley', 'Handbag', 'Handheld', 'Pocket', 'Running', 'Slow Walking']
+        self.label_names = ['Trolley', 'Handbag', 'Handheld', 'Pocket', 'Running', 'Slow Walking', 'Standing']
         
         # 각 이동 상태별 허용 분산 임계값 (Threshold)
         self.class_thresholds = {
@@ -27,11 +28,23 @@ class TLIO_EKF_Manager:
         
         self.confidence_threshold = 0.7
 
+    def init_ekf(self, start_pos=None, acc_init=None, **ekf_kwargs):
+        from ekf_processor import TLIO_EKF
+        self.ekf = TLIO_EKF(**ekf_kwargs)
+        if start_pos is not None:
+            self.ekf.p = np.array(start_pos).reshape(3, 1)
+        if acc_init is not None:
+            self.ekf.initialize_orientation(acc_init)
+            
+        # Temporal Alignment: 과거 위치 버퍼
+        self.pos_buffer = [] 
+        print(f"EKF Initialized with params: {ekf_kwargs}")
+
     @torch.no_grad()
     def get_observation(self, imu_window):
         """
         Args:
-            imu_window: (1, 12, 100), (1, 100, 12), (12, 100), (100, 12) 등 모든 형태 지원
+            imu_window: (12, 100) 형태 (user_acc, rotation_rate, gravity, attitude)
         """
         # 1. 텐서 변환 및 디바이스 이동
         if isinstance(imu_window, np.ndarray):
@@ -39,21 +52,12 @@ class TLIO_EKF_Manager:
         else:
             x = imu_window.float().to(self.device)
             
-        # 2. [차원 교정 로직]
-        # Conv1d는 반드시 (Batch, Channel=12, Length=100)을 원함
-        
-        # 2-1. 배치 차원(1)이 없는 경우 (12, 100) 혹은 (100, 12)
+        # [차원 교정 로직 생략 - 이미 구현됨]
         if x.dim() == 2:
-            if x.shape[0] == 100 and x.shape[1] == 12:
-                x = x.t() # -> (12, 100)
-            x = x.unsqueeze(0) # -> (1, 12, 100)
-            
-        # 2-2. 배치 차원이 포함된 경우 (1, 12, 100) 혹은 (1, 100, 12)
+            if x.shape[0] == 100 and x.shape[1] == 12: x = x.t()
+            x = x.unsqueeze(0)
         elif x.dim() == 3:
-            if x.shape[1] == 100 and x.shape[2] == 12:
-                x = x.transpose(1, 2) # -> (1, 12, 100)
-            elif x.shape[1] == 1 and x.shape[2] == 1200:
-                x = x.view(1, 12, 100)
+            if x.shape[1] == 100 and x.shape[2] == 12: x = x.transpose(1, 2)
         
         # 3. 모델 추론
         pred_cls, pred_mu, pred_log_var = self.model(x)
@@ -71,13 +75,13 @@ class TLIO_EKF_Manager:
         final_R_diag = np.copy(var_net)
         
         if conf < self.confidence_threshold:
-            status = "Uncertain (Using Raw Net Variance)"
-            final_R_diag = var_net * 1.5 
+            status = "Uncertain"
+            final_R_diag = var_net * 2.0 
         else:
             threshold = self.class_thresholds.get(pred_idx, 0.1)
             for i in range(len(var_net)):
                 if var_net[i] > threshold:
-                    final_R_diag[i] = var_net[i] * 2.0 
+                    final_R_diag[i] = var_net[i] * 5.0 # 더 보수적으로 필터링
             status = f"Steady ({self.label_names[pred_idx]})"
 
         return {
@@ -86,6 +90,36 @@ class TLIO_EKF_Manager:
             'status': status,
             'confidence': conf
         }
+
+    def step(self, imu_raw, dt, ai_window=None):
+        if self.ekf is None:
+            self.init_ekf()
+
+        # 1. Prediction (IMU Propagation)
+        acc = imu_raw[0:3]
+        gyr = imu_raw[3:6]
+        self.ekf.predict(dt, gyr, acc)
+        
+        # 기하학적 정렬을 위해 현재 위치 버퍼링
+        self.pos_buffer.append(self.ekf.p.copy())
+        if len(self.pos_buffer) > 200:
+            self.pos_buffer.pop(0)
+
+        # 2. Update (AI Observation)
+        if ai_window is not None:
+            obs = self.get_observation(ai_window)
+            
+            # Stochastic Cloning Lite: 
+            # 모델이 쓴 윈도우(100샘플)의 시작점 위치를 찾아 기준점으로 삼습니다.
+            window_size = 100
+            if len(self.pos_buffer) >= window_size:
+                p_old = self.pos_buffer[-window_size]
+                z_pos = p_old + obs['z'][:3].reshape(3, 1)
+                self.ekf.update(z_pos, obs['R'][:3, :3])
+            
+            return self.ekf.get_state(), obs
+        
+        return self.ekf.get_state(), None
 
 if __name__ == "__main__":
     import os
